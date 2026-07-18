@@ -1,0 +1,45 @@
+## 🛠️ How to Use
+
+### 1. Spawn Vehicle
+- Spawn a supported car in-game
+
+---
+
+### 2. Connect the System
+- Click on the car model (ModelClick / interaction prompt)
+- The system will attach to the vehicle
+
+---
+
+### 3. Enter the Vehicle
+- Sit in the driver seat as normal
+
+---
+
+### 4. Enable Drive Assist
+- Locate the **Drive Assist** control
+- Toggle it ON
+
+---
+
+### 5. Drive
+
+- Steering remains fully manual
+- Assist will:
+  - Analyze surroundings in real time
+  - Help avoid collisions
+  - Keep the vehicle centered when possible
+
+---
+
+### ⚙️ Settings & Debug
+
+- Open settings panel to:
+  - Adjust behavior
+  - Tune responsiveness
+  - Modify ray settings
+
+- Enable **Debug Mode** to:
+  - View raycasts in real time
+  - See color states (GREEN / YELLOW / ORANGE / RED)
+  - Monitor system behavior live
