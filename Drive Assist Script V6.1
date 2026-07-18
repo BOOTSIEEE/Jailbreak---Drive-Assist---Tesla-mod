@@ -1,0 +1,1430 @@
+-- Auto-Drive Assist: Predictive Proximity Engine & Dynamic Bezier Waypoints (v6.1)
+-- LocalScript: StarterPlayer > StarterPlayerScripts
+--
+-- v6.1 - memory/FPS leak fixes:
+--   * FIXED: raycast direction sign was inverted (turning left extended the
+--     RIGHT rays instead of the left, and the car steered toward the
+--     "unsafe" side). Negated the angle fed into fromAxisAngle so ray
+--     geometry now matches the left/right convention used everywhere else
+--     (steerBias, confidence vote, manual-override coloring, status text).
+--   * FIXED: rebuildIgnoreList() was firing on every single
+--     DescendantAdded/Removing signal from the vehicle (exhaust smoke, skid
+--     marks, sounds, etc. fire this constantly), each time doing a full
+--     GetDescendants() walk + new table allocation - this was the actual
+--     source of the "gets slower forever, drags FPS/terrain streaming down"
+--     leak, and it ran regardless of CONFIG.Enabled. Now debounced: watchers
+--     just flip a dirty flag, and the real rebuild runs at most twice a
+--     second (IGNORE_LIST_REBUILD_INTERVAL) instead of on every event.
+--   * FIXED: applyAcceleration() also called GetDescendants() every single
+--     frame just to find Thrust/Motor parts. Folded into the same cached
+--     pass as the ignore list (cachedThrustParts), rebuilt on the same
+--     debounced schedule instead of every Heartbeat.
+--   * FIXED: disconnectVehicleWatchers() cleared vehicleWatchConnections but
+--     left the same Connection objects sitting permanently in the global
+--     `connections` table, so every vehicle reselect leaked 2 dead entries
+--     for the rest of the session. Now removed from both lists together.
+--
+-- v6.0 - confidence-based steering + adaptive raycasts:
+--   * Standard Assist (and headless Auto-Navigate cruise) no longer steers off
+--     a raw repulsion vector. It now votes: every ray is classified "safe" (green)
+--     or "danger" based on GreenThreshold, tallied separately per side, and the
+--     two sides' safe-fractions are compared. The car only commits to a side when
+--     the margin between them clears DecisionConfidence (e.g. 70% safe left vs
+--     30% safe right = a confident call). A near-even split (a "coin flip") no
+--     longer produces a random-looking swerve - it holds straight instead.
+--   * Raycasts are no longer fixed-length/fixed-angle. Each ray's length and
+--     angle now adapt smoothly (frame-to-frame lerp, never a snap) to current
+--     steering intent (manual input if you're steering, otherwise the assist's
+--     own applied turn):
+--       - Driving straight: front-facing rays extend (spot things sooner ahead),
+--         edge rays pull in slightly and fan out a touch wider (better peripheral
+--         coverage for cross traffic / walls coming up at corners).
+--       - Turning either direction: rays on the side you're committing to
+--         extend, the front rays and the opposite-side rays shrink - so the
+--         sensor budget goes toward the direction you're actually going, not
+--         wasted on space you're turning away from.
+--   * All of the above is tunable from the new "Raycasts" settings tab.
+--     General/behavior settings moved to a separate "Other" tab. Press
+--     RightShift any time to show/hide the whole settings panel.
+--   * (carried over from v5.9) fixed the per-frame ignore-list rebuild that
+--     caused the script to get laggier the longer it ran, cleared stale thrust
+--     force references on vehicle reselect, and stopped rays that hit nothing
+--     from generating fake threat/steering at speed.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local mouse = player:GetMouse()
+
+-- == REFRESH / CLEANUP HANDLER ==
+if _G.AutoDriveAssist_Cleanup then
+	pcall(_G.AutoDriveAssist_Cleanup)
+end
+
+local connections = {}
+local function trackConnection(conn)
+	table.insert(connections, conn)
+	return conn
+end
+
+_G.AutoDriveAssist_Cleanup = function()
+	for _, conn in ipairs(connections) do
+		conn:Disconnect()
+	end
+	table.clear(connections)
+	RunService:UnbindFromRenderStep("AutoDriveAssist_ApplyAngularVelocity")
+	
+	if Workspace:FindFirstChild("AutoDriveAssist_Visuals") then
+		Workspace.AutoDriveAssist_Visuals:Destroy()
+	end
+	if player.PlayerGui:FindFirstChild("AutoDriveAssistGui") then
+		player.PlayerGui.AutoDriveAssistGui:Destroy()
+	end
+end
+-- ===============================
+
+local CONFIG = {
+	Enabled = false,
+	MouseFollow = false,
+	AutoNavigate = false,
+	ShowVisuals = false,
+
+	RayCount = 3,          
+	WaypointCount = 3,      
+	
+	SpreadDegrees = 46,
+	RayLength = 20,
+	ReactionDistance = 31,
+	EngageUrgency = 0.03,
+	TargetSpeed = 50,       
+
+	OffsetX = 0,
+	OffsetY = 2.0,          
+	OffsetZ = 6.0,          
+
+	TurnRate = 1.3,
+	TurnSmoothing = 25,
+
+	ClosingRateWindow = 0.50, -- seconds: how far ahead we predict "will I actually reach this" per-ray
+
+	AssistAutoThrottle = false, -- OFF by default: standard assist only steers, driver keeps the pedals.
+	ThrottleRampRate = 2.5,     -- max change in throttle (0-1 scale) per second - real acceleration, not a snap
+
+	RecoveryToleranceDegrees = 4,
+	RecoveryMaxAngleDegrees = 40,
+	MouseFollowMaxAngleDegrees = 60,
+	
+	MaxGroundSlopeNormal = 0.70, 
+
+	InvertSteering = false,
+	OverrideKey = Enum.KeyCode.LeftShift,
+
+	-- == Confidence-vote steering ==
+	GreenThreshold = 0.50,     -- a ray counts as "safe/green" when its threat urgency is below this
+	DecisionConfidence = 0.20, -- required safe-fraction margin between sides before committing to a turn (0.20 = needs roughly 60/40 or clearer)
+
+	-- == Adaptive raycast geometry ==
+	RayLengthVariance = 0.64, -- 0 = all rays always the same length. Higher = more aggressive length shift toward the committed direction.
+	RayAngleShift = 15,       -- degrees of extra outward fan-out for edge rays while driving straight
+	RayAdaptSmoothing = 10,    -- how quickly ray geometry catches up to steering intent (higher = snappier)
+
+	Colors = {
+		Green  = Color3.fromRGB(60, 150, 80),
+		Yellow = Color3.fromRGB(255, 220, 0),
+		Orange = Color3.fromRGB(255, 110, 0),
+		Red    = Color3.fromRGB(255, 30, 30),
+		Blue   = Color3.fromRGB(40, 140, 255),
+		Purple = Color3.fromRGB(180, 80, 255),
+	},
+}
+
+local selectedVehicle = nil
+local steeringController = nil
+local gearShiftRemote = nil
+local pickingVehicle = false
+local bindingKey = false
+
+local vehicleWidth = 6
+local vehicleLength = 15
+
+local targetTurnRate = 0
+local appliedTurnRate = 0
+local currentUrgency = 0
+local wasControlling = false
+local isOverriding = false
+
+local currentThrottle = 0
+local lastGearReverse = false
+
+local isAvoiding = false
+local isRecovering = false
+local recoveryHeading = nil
+local targetPosition = nil
+
+-- Smoothed steering-intent signal driving adaptive ray geometry.
+-- Convention: -1 = fully committed left, 0 = straight, +1 = fully committed right.
+-- Matches manualSteer's own sign convention (A/Left = -1, D/Right = +1).
+local smoothedSteerBias = 0
+
+local rayParts = {}
+local waypointParts = {}
+local predictionParts = {}
+local originalThrustForces = {}
+
+-- Cached raycast filter state. Rebuilt only on vehicle select, respawn, or
+-- (debounced) actual structural changes to the vehicle - NOT every frame and
+-- NOT on every single DescendantAdded/Removing signal fire. Building this
+-- from GetDescendants() + a fresh RaycastParams on every such event was the
+-- main source of the "gets laggier the longer I play" behavior: vehicle FX
+-- (exhaust, skid marks, sounds) churn descendants constantly, so this could
+-- fire many times a second and generate garbage nonstop.
+local cachedRaycastParams = nil
+local cachedIgnoreList = {}
+local cachedThrustParts = {}
+local ignoreListDirty = true
+local timeSinceIgnoreListRebuild = math.huge
+local IGNORE_LIST_REBUILD_INTERVAL = 0.5 -- seconds; debounce window for the expensive full rebuild
+local vehicleWatchConnections = {}
+
+local visualFolder = Instance.new("Folder")
+visualFolder.Name = "AutoDriveAssist_Visuals"
+visualFolder.Parent = Workspace
+
+local function horizontalDirection(vector)
+	local flat = Vector3.new(vector.X, 0, vector.Z)
+	if flat.Magnitude < 0.001 then return Vector3.new(0, 0, -1) end
+	return flat.Unit
+end
+
+local function signedAngleY(fromDir, toDir)
+	local cross = fromDir:Cross(toDir)
+	local dot = fromDir:Dot(toDir)
+	return math.atan2(cross.Y, dot)
+end
+
+local function findVehicle(instance)
+	while instance and instance ~= Workspace do
+		if instance:IsA("Model") and instance:FindFirstChild("Engine") then
+			return instance
+		end
+		instance = instance.Parent
+	end
+	return nil
+end
+
+local function updateVehicleDimensions(vehicle)
+	if not vehicle then return end
+	local _, size = vehicle:GetBoundingBox()
+	vehicleWidth = math.min(size.X, size.Z)
+	vehicleLength = math.max(size.X, size.Z)
+end
+
+local function findSteeringController(vehicle)
+	local engine = vehicle and vehicle:FindFirstChild("Engine")
+	if not engine then return nil end
+	local bav = engine:FindFirstChildOfClass("BodyAngularVelocity")
+	if bav then
+		bav.MaxTorque = Vector3.new(0, math.huge, 0)
+	end
+	return bav
+end
+
+-- Looks for a gear-shift RemoteEvent directly under the vehicle (matches the
+-- "GearShiftRemote" seen in this vehicle's own drivetrain). If your vehicle kit
+-- names it differently, or expects different arguments than a single boolean
+-- (true = reverse), adjust the FireServer call inside updateThrottle below.
+local function findGearShiftRemote(vehicle)
+	return vehicle and vehicle:FindFirstChild("GearShiftRemote")
+end
+
+-- Disconnects the per-vehicle DescendantAdded/Removing watchers. Called both
+-- when you pick a new vehicle (so watchers from the OLD vehicle don't keep
+-- piling up) and from the master cleanup handler on script refresh. Also
+-- removes these same Connection objects from the global `connections` list -
+-- previously they were only cleared from vehicleWatchConnections, leaving 2
+-- dead entries behind in `connections` on every single vehicle reselect.
+local function disconnectVehicleWatchers()
+	for _, conn in ipairs(vehicleWatchConnections) do
+		conn:Disconnect()
+		for i = #connections, 1, -1 do
+			if connections[i] == conn then
+				table.remove(connections, i)
+				break
+			end
+		end
+	end
+	table.clear(vehicleWatchConnections)
+end
+
+-- Rebuilds the cached raycast ignore list + RaycastParams, AND the cached
+-- thrust-part list used by applyAcceleration (folded into the same single
+-- descendant pass so we're not walking GetDescendants() twice for the same
+-- purpose). Only runs on vehicle select, character respawn, or a debounced
+-- structural-change signal (see ignoreListDirty / IGNORE_LIST_REBUILD_INTERVAL
+-- below) - NOT every frame, and NOT on every raw DescendantAdded event.
+local function rebuildIgnoreList()
+	local character = player.Character
+	local list = { character, selectedVehicle }
+	local thrustParts = {}
+
+	if selectedVehicle then
+		for _, child in ipairs(selectedVehicle:GetDescendants()) do
+			if child:IsA("BasePart") then
+				table.insert(list, child)
+			end
+			if child:IsA("VectorForce") and child.Parent and (child.Parent.Name == "Thrust" or string.find(child.Name, "Thrust")) then
+				table.insert(thrustParts, { kind = "force", inst = child })
+			elseif child:IsA("HingeConstraint") and child.ActuatorType == Enum.ActuatorType.Motor then
+				table.insert(thrustParts, { kind = "motor", inst = child })
+			end
+		end
+	end
+
+	cachedIgnoreList = list
+	cachedThrustParts = thrustParts
+
+	if not cachedRaycastParams then
+		cachedRaycastParams = RaycastParams.new()
+		cachedRaycastParams.FilterType = Enum.RaycastFilterType.Exclude
+		cachedRaycastParams.IgnoreWater = true
+	end
+	cachedRaycastParams.FilterDescendantsInstances = cachedIgnoreList
+end
+
+-- == SEVERITY / TURN-INTENSITY CURVE (color AND steering strength share one source of truth) ==
+local SEVERITY_CURVE = {
+	{ t = 0.00, color = CONFIG.Colors.Green,          turnMult = 0.22 },
+	{ t = 0.15, color = Color3.fromRGB(160, 195, 60), turnMult = 0.32 }, -- yellow-green
+	{ t = 0.30, color = CONFIG.Colors.Yellow,         turnMult = 0.46 },
+	{ t = 0.45, color = Color3.fromRGB(255, 165, 0),  turnMult = 0.62 }, -- amber
+	{ t = 0.60, color = CONFIG.Colors.Orange,         turnMult = 0.78 },
+	{ t = 0.78, color = Color3.fromRGB(255, 65, 20),  turnMult = 0.92 }, -- orange-red
+	{ t = 1.00, color = CONFIG.Colors.Red,            turnMult = 1.00 },
+}
+
+local function evaluateSeverity(urgencyFraction)
+	urgencyFraction = math.clamp(urgencyFraction, 0, 1)
+	for i = 1, #SEVERITY_CURVE - 1 do
+		local a, b = SEVERITY_CURVE[i], SEVERITY_CURVE[i + 1]
+		if urgencyFraction <= b.t then
+			local span = b.t - a.t
+			local localT = span > 0 and (urgencyFraction - a.t) / span or 0
+			return a.color:Lerp(b.color, localT), a.turnMult + (b.turnMult - a.turnMult) * localT
+		end
+	end
+	local last = SEVERITY_CURVE[#SEVERITY_CURVE]
+	return last.color, last.turnMult
+end
+
+-- Uses the cached thrust-part list (built alongside the ignore list in
+-- rebuildIgnoreList) instead of calling selectedVehicle:GetDescendants()
+-- every single time throttle is applied (previously every Heartbeat that
+-- touched throttle) - that was a second constant-allocation hotspot.
+local function applyAcceleration(throttleMultiplier)
+print("applyAcceleration called:", throttleMultiplier, "#thrustParts:", #cachedThrustParts)
+	if not selectedVehicle then return end
+	
+	local seat = selectedVehicle:FindFirstChildOfClass("VehicleSeat", true)
+	if seat then
+		seat.ThrottleFloat = throttleMultiplier
+	end
+
+	for _, entry in ipairs(cachedThrustParts) do
+		local desc = entry.inst
+		if desc.Parent then -- guards against something destroyed since the cache was last built;
+			                 -- the dirty-flag debounce will catch up and refresh shortly after
+			if entry.kind == "force" then
+				if not originalThrustForces[desc] then
+					if desc.Force.Magnitude > 1000 then
+						originalThrustForces[desc] = desc.Force
+					else
+						originalThrustForces[desc] = Vector3.new(0, 105000, 0)
+					end
+				end
+				desc.Force = originalThrustForces[desc] * throttleMultiplier
+			else
+				desc.MotorMaxTorque = 50000
+				desc.AngularVelocity = (CONFIG.TargetSpeed * 1.5) * throttleMultiplier
+			end
+		end
+	end
+end
+
+-- Ramps the actual applied throttle toward a target instead of snapping to it -
+-- real acceleration takes time, and slamming straight to full throttle/full reverse
+-- is often what makes a "reverse" or "auto throttle" command look like it did nothing.
+-- Also handles the forward/reverse gear flip: many vehicle kits (this one included,
+-- given the GearShiftRemote) expect to be told when to shift gear rather than just
+-- receiving a negative force - so we fire it once, edge-triggered, when direction
+-- flips AND the vehicle has slowed down enough to shift like a real transmission.
+local function updateThrottle(dt, targetThrottle, currentSpeed)
+	targetThrottle = math.clamp(targetThrottle, -1, 1)
+	local maxDelta = CONFIG.ThrottleRampRate * dt
+	local delta = math.clamp(targetThrottle - currentThrottle, -maxDelta, maxDelta)
+	currentThrottle += delta
+
+	local wantsReverse = currentThrottle < -0.05
+	if wantsReverse ~= lastGearReverse and currentSpeed < 6 then
+		lastGearReverse = wantsReverse
+		if gearShiftRemote then
+			pcall(function()
+				gearShiftRemote:FireServer(wantsReverse)
+			end)
+		end
+	end
+
+	applyAcceleration(currentThrottle)
+end
+
+local function drawRay(index, origin, endpoint, color)
+	if not CONFIG.ShowVisuals then return end
+
+	local part = rayParts[index]
+	if not part then
+		part = Instance.new("Part")
+		part.Name = "SensorRay_" .. index
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanTouch = false
+		part.CanQuery = false
+		part.Material = Enum.Material.Neon
+		part.Parent = visualFolder
+		rayParts[index] = part
+	end
+
+	local length = math.max((endpoint - origin).Magnitude, 0.05)
+	part.Size = Vector3.new(0.15, 0.15, length)
+	part.CFrame = CFrame.lookAt(origin, endpoint) * CFrame.new(0, 0, -length / 2)
+	part.Color = color
+	part.Transparency = 0.15
+end
+
+local function drawPredictiveLine(index, startPos, endPos)
+	if not CONFIG.ShowVisuals then return end
+
+	local part = predictionParts[index]
+	if not part then
+		part = Instance.new("Part")
+		part.Name = "PredictLine_" .. index
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanTouch = false
+		part.CanQuery = false
+		part.Material = Enum.Material.Neon
+		part.Color = CONFIG.Colors.Blue -- Always clean Tesla Blue
+		part.Parent = visualFolder
+		predictionParts[index] = part
+	end
+
+	local length = math.max((endPos - startPos).Magnitude, 0.05)
+	part.Size = Vector3.new(0.3, 0.3, length)
+	part.CFrame = CFrame.lookAt(startPos, endPos) * CFrame.new(0, 0, -length / 2)
+	part.Transparency = 0.15
+end
+
+local function drawWaypoint(index, pos, color, labelText)
+	if not CONFIG.ShowVisuals or not pos then
+		if waypointParts[index] then waypointParts[index]:Destroy() waypointParts[index] = nil end
+		return
+	end
+
+	local part = waypointParts[index]
+	if not part then
+		part = Instance.new("Part")
+		part.Name = "Waypoint_" .. index
+		part.Shape = Enum.PartType.Ball
+		part.Size = Vector3.new(2.5, 2.5, 2.5)
+		part.Anchored = true
+		part.CanCollide = false
+		part.CanTouch = false
+		part.CanQuery = false
+		part.Material = Enum.Material.Neon
+		part.Parent = visualFolder
+		
+		local bb = Instance.new("BillboardGui", part)
+		bb.Size = UDim2.fromOffset(100, 25)
+		bb.AlwaysOnTop = true
+		bb.ExtentsOffset = Vector3.new(0, 2, 0)
+		local lbl = Instance.new("TextLabel", bb)
+		lbl.Size = UDim2.fromScale(1, 1)
+		lbl.BackgroundTransparency = 1
+		lbl.Font = Enum.Font.GothamBold
+		lbl.TextSize = 11
+		lbl.TextColor3 = Color3.new(1, 1, 1)
+		lbl.TextStrokeTransparency = 0
+		
+		waypointParts[index] = part
+	end
+
+	part.Position = pos
+	part.Color = color
+	if part:FindFirstChildOfClass("BillboardGui") and part.BillboardGui:FindFirstChildOfClass("TextLabel") then
+		part.BillboardGui.TextLabel.Text = labelText or ("P" .. index)
+		part.BillboardGui.TextLabel.TextColor3 = color
+	end
+end
+
+local function cleanUnusedVisuals()
+	for i = CONFIG.RayCount + 1, #rayParts do
+		if rayParts[i] then rayParts[i]:Destroy() rayParts[i] = nil end
+	end
+	for i = CONFIG.WaypointCount + 1, #waypointParts do
+		if waypointParts[i] then waypointParts[i]:Destroy() waypointParts[i] = nil end
+	end
+end
+
+local function clearPredictiveVisuals()
+	for _, part in pairs(predictionParts) do part:Destroy() end
+	table.clear(predictionParts)
+end
+
+local function clearVisuals()
+	for _, part in pairs(rayParts) do part:Destroy() end
+	for _, part in pairs(waypointParts) do part:Destroy() end
+	clearPredictiveVisuals()
+	table.clear(rayParts)
+	table.clear(waypointParts)
+end
+
+local function resetAssistState()
+	targetTurnRate = 0
+	appliedTurnRate = 0
+	currentUrgency = 0
+	isAvoiding = false
+	isRecovering = false
+	recoveryHeading = nil
+	wasControlling = false
+	targetPosition = nil
+	currentThrottle = 0
+	smoothedSteerBias = 0
+	applyAcceleration(0)
+	clearVisuals()
+	table.clear(originalThrustForces) -- drop refs to old vehicles' thrust parts, don't grow forever
+end
+
+-- == GUI SETUP ==
+local gui = Instance.new("ScreenGui")
+gui.Name = "AutoDriveAssistGui"
+gui.ResetOnSpawn = false
+gui.Parent = player.PlayerGui
+
+local panel = Instance.new("Frame")
+panel.Size = UDim2.fromOffset(320, 600)
+panel.Position = UDim2.new(1, -340, 0, 20)
+panel.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+panel.BorderSizePixel = 0
+panel.Parent = gui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -20, 0, 24)
+title.Position = UDim2.fromOffset(10, 5)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Text = "Tesla Predictive Assist Engine v6.1"
+title.Parent = panel
+
+local hint = Instance.new("TextLabel")
+hint.Size = UDim2.new(1, -20, 0, 14)
+hint.Position = UDim2.fromOffset(10, 27)
+hint.BackgroundTransparency = 1
+hint.Font = Enum.Font.Gotham
+hint.TextSize = 10
+hint.TextXAlignment = Enum.TextXAlignment.Left
+hint.TextColor3 = Color3.fromRGB(140, 140, 145)
+hint.Text = "RightShift: show/hide this panel"
+hint.Parent = panel
+
+-- Fixed, always-visible primary controls (core driving modes - not "settings")
+local primaryFrame = Instance.new("Frame")
+primaryFrame.Size = UDim2.new(1, -10, 0, 148)
+primaryFrame.Position = UDim2.fromOffset(5, 44)
+primaryFrame.BackgroundTransparency = 1
+primaryFrame.Parent = panel
+
+local primaryList = Instance.new("UIListLayout")
+primaryList.SortOrder = Enum.SortOrder.LayoutOrder
+primaryList.Padding = UDim.new(0, 6)
+primaryList.Parent = primaryFrame
+
+local function makeButton(parent, text, order)
+	local button = Instance.new("TextButton")
+	button.Size = UDim2.new(1, 0, 0, 32)
+	button.BackgroundColor3 = Color3.fromRGB(62, 62, 70)
+	button.BorderSizePixel = 0
+	button.Font = Enum.Font.GothamBold
+	button.TextSize = 13
+	button.TextColor3 = Color3.new(1, 1, 1)
+	button.Text = text
+	button.LayoutOrder = order
+	button.Parent = parent
+	Instance.new("UICorner", button).CornerRadius = UDim.new(0, 6)
+	return button
+end
+
+local toggleButton       = makeButton(primaryFrame, "Assist: OFF", 1)
+local selectButton       = makeButton(primaryFrame, "Select your car model", 2)
+local mouseFollowButton  = makeButton(primaryFrame, "Mouse Follow: OFF", 3)
+local autoNavigateButton = makeButton(primaryFrame, "Auto-Navigate (Cruise & Waypoints): OFF", 4)
+
+-- == TAB BAR ==
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, -10, 0, 28)
+tabBar.Position = UDim2.fromOffset(5, 198)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = panel
+
+local raycastTabButton = Instance.new("TextButton")
+raycastTabButton.Size = UDim2.new(0.5, -3, 1, 0)
+raycastTabButton.Position = UDim2.fromScale(0, 0)
+raycastTabButton.BorderSizePixel = 0
+raycastTabButton.Font = Enum.Font.GothamBold
+raycastTabButton.TextSize = 12
+raycastTabButton.Text = "Raycasts"
+raycastTabButton.Parent = tabBar
+Instance.new("UICorner", raycastTabButton).CornerRadius = UDim.new(0, 6)
+
+local otherTabButton = Instance.new("TextButton")
+otherTabButton.Size = UDim2.new(0.5, -3, 1, 0)
+otherTabButton.Position = UDim2.fromScale(0.5, 0)
+otherTabButton.AnchorPoint = Vector2.new(0, 0)
+otherTabButton.Position = UDim2.new(0.5, 3, 0, 0)
+otherTabButton.BorderSizePixel = 0
+otherTabButton.Font = Enum.Font.GothamBold
+otherTabButton.TextSize = 12
+otherTabButton.Text = "Other"
+otherTabButton.Parent = tabBar
+Instance.new("UICorner", otherTabButton).CornerRadius = UDim.new(0, 6)
+
+local raycastScroll = Instance.new("ScrollingFrame")
+raycastScroll.Size = UDim2.new(1, -10, 1, -287)
+raycastScroll.Position = UDim2.fromOffset(5, 231)
+raycastScroll.BackgroundTransparency = 1
+raycastScroll.ScrollBarThickness = 4
+raycastScroll.Parent = panel
+
+local raycastList = Instance.new("UIListLayout")
+raycastList.SortOrder = Enum.SortOrder.LayoutOrder
+raycastList.Padding = UDim.new(0, 8)
+raycastList.Parent = raycastScroll
+
+local otherScroll = Instance.new("ScrollingFrame")
+otherScroll.Size = UDim2.new(1, -10, 1, -287)
+otherScroll.Position = UDim2.fromOffset(5, 231)
+otherScroll.BackgroundTransparency = 1
+otherScroll.ScrollBarThickness = 4
+otherScroll.Visible = false
+otherScroll.Parent = panel
+
+local otherList = Instance.new("UIListLayout")
+otherList.SortOrder = Enum.SortOrder.LayoutOrder
+otherList.Padding = UDim.new(0, 8)
+otherList.Parent = otherScroll
+
+local function setActiveTab(tabName)
+	local raycastActive = tabName == "raycasts"
+	raycastScroll.Visible = raycastActive
+	otherScroll.Visible = not raycastActive
+	raycastTabButton.BackgroundColor3 = raycastActive and Color3.fromRGB(55, 105, 165) or Color3.fromRGB(50, 50, 56)
+	otherTabButton.BackgroundColor3 = (not raycastActive) and Color3.fromRGB(55, 105, 165) or Color3.fromRGB(50, 50, 56)
+end
+
+trackConnection(raycastTabButton.MouseButton1Click:Connect(function() setActiveTab("raycasts") end))
+trackConnection(otherTabButton.MouseButton1Click:Connect(function() setActiveTab("other") end))
+setActiveTab("raycasts")
+
+local function makeSlider(parent, labelText, minVal, maxVal, currentVal, isFloat, order, callback)
+	local container = Instance.new("Frame")
+	container.Size = UDim2.new(1, -10, 0, 45)
+	container.BackgroundTransparency = 1
+	container.LayoutOrder = order
+	container.Parent = parent
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 0, 16)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.Gotham
+	label.TextSize = 12
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.Text = labelText .. ": " .. tostring(currentVal)
+	label.Parent = container
+
+	local track = Instance.new("Frame")
+	track.Size = UDim2.new(1, 0, 0, 8)
+	track.Position = UDim2.new(0, 0, 0, 24)
+	track.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
+	track.BorderSizePixel = 0
+	track.Parent = container
+	Instance.new("UICorner", track).CornerRadius = UDim.new(1, 0)
+
+	local fill = Instance.new("Frame")
+	local initialPct = (currentVal - minVal) / (maxVal - minVal)
+	fill.Size = UDim2.new(math.clamp(initialPct, 0, 1), 0, 1, 0)
+	fill.BackgroundColor3 = Color3.fromRGB(80, 140, 200)
+	fill.BorderSizePixel = 0
+	fill.Parent = track
+	Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+	local knob = Instance.new("TextButton")
+	knob.Size = UDim2.fromOffset(16, 16)
+	knob.Position = UDim2.new(1, -8, 0.5, -8)
+	knob.BackgroundColor3 = Color3.new(1, 1, 1)
+	knob.Text = ""
+	knob.Parent = fill
+	Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+	local dragging = false
+	local function updateSlider(input)
+		local relativeX = math.clamp(input.Position.X - track.AbsolutePosition.X, 0, track.AbsoluteSize.X)
+		local pct = relativeX / track.AbsoluteSize.X
+		local val = minVal + pct * (maxVal - minVal)
+		if not isFloat then val = math.floor(val + 0.5) end
+		
+		fill.Size = UDim2.new(pct, 0, 1, 0)
+		label.Text = string.format("%s: %s", labelText, isFloat and string.format("%.2f", val) or tostring(val))
+		callback(val)
+	end
+
+	trackConnection(knob.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true end
+	end))
+
+	trackConnection(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+	end))
+
+	trackConnection(UserInputService.InputChanged:Connect(function(input)
+		if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then updateSlider(input) end
+	end))
+	
+	trackConnection(track.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging = true
+			updateSlider(input)
+		end
+	end))
+
+	return container
+end
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -20, 0, 50)
+status.Position = UDim2.new(0, 10, 1, -55)
+status.BackgroundTransparency = 1
+status.Font = Enum.Font.Gotham
+status.TextSize = 12
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextYAlignment = Enum.TextYAlignment.Top
+status.TextWrapped = true
+status.TextColor3 = Color3.fromRGB(190, 190, 190)
+status.Text = "Select your car model to calibrate."
+status.Parent = panel
+
+-- == RAYCASTS TAB ==
+local debugVisualsButton = makeButton(raycastScroll, "Debug Visuals: OFF", 1)
+debugVisualsButton.Size = UDim2.new(1, -10, 0, 32)
+
+makeSlider(raycastScroll, "Raycast Count", 3, 100, CONFIG.RayCount, false, 2, function(v) CONFIG.RayCount = v end)
+makeSlider(raycastScroll, "Raycast Spread (deg, 360=full circle)", 10, 360, CONFIG.SpreadDegrees, false, 3, function(v) CONFIG.SpreadDegrees = v end)
+makeSlider(raycastScroll, "Base Ray Length", 20, 200, CONFIG.RayLength, false, 4, function(v) CONFIG.RayLength = v end)
+makeSlider(raycastScroll, "Reaction Distance", 10, 100, CONFIG.ReactionDistance, false, 5, function(v) CONFIG.ReactionDistance = v end)
+makeSlider(raycastScroll, "Early Engage Urgency", 0.01, 0.50, CONFIG.EngageUrgency, true, 6, function(v) CONFIG.EngageUrgency = v end)
+makeSlider(raycastScroll, "Sensor Offset Y (Height)", -5, 10, CONFIG.OffsetY, true, 7, function(v) CONFIG.OffsetY = v end)
+makeSlider(raycastScroll, "Sensor Offset Z (Fwd)", -10, 20, CONFIG.OffsetZ, false, 8, function(v) CONFIG.OffsetZ = v end)
+makeSlider(raycastScroll, "Closing-Rate Prediction (s)", 0.5, 4.0, CONFIG.ClosingRateWindow, true, 9, function(v) CONFIG.ClosingRateWindow = v end)
+makeSlider(raycastScroll, "Green (Safe) Threshold", 0.05, 0.50, CONFIG.GreenThreshold, true, 10, function(v) CONFIG.GreenThreshold = v end)
+makeSlider(raycastScroll, "Decision Confidence Needed", 0.05, 0.60, CONFIG.DecisionConfidence, true, 11, function(v) CONFIG.DecisionConfidence = v end)
+makeSlider(raycastScroll, "Ray Length Variance (Adaptive)", 0.0, 1.0, CONFIG.RayLengthVariance, true, 12, function(v) CONFIG.RayLengthVariance = v end)
+makeSlider(raycastScroll, "Ray Angle Shift (deg, Straight)", 0, 40, CONFIG.RayAngleShift, false, 13, function(v) CONFIG.RayAngleShift = v end)
+makeSlider(raycastScroll, "Ray Adapt Smoothing", 1, 20, CONFIG.RayAdaptSmoothing, false, 14, function(v) CONFIG.RayAdaptSmoothing = v end)
+
+trackConnection(debugVisualsButton.MouseButton1Click:Connect(function()
+	CONFIG.ShowVisuals = not CONFIG.ShowVisuals
+	if not CONFIG.ShowVisuals then clearVisuals() end
+	debugVisualsButton.Text = CONFIG.ShowVisuals and "Debug Visuals: ON" or "Debug Visuals: OFF"
+	debugVisualsButton.BackgroundColor3 = CONFIG.ShowVisuals and Color3.fromRGB(80, 80, 90) or Color3.fromRGB(62, 62, 70)
+end))
+
+raycastScroll.CanvasSize = UDim2.new(0, 0, 0, raycastList.AbsoluteContentSize.Y + 10)
+trackConnection(raycastList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	raycastScroll.CanvasSize = UDim2.new(0, 0, 0, raycastList.AbsoluteContentSize.Y + 10)
+end))
+
+-- == OTHER TAB ==
+local keybindButton      = makeButton(otherScroll, "Hold-Override Key: LeftShift", 1)
+keybindButton.Size = UDim2.new(1, -10, 0, 32)
+local assistThrottleButton = makeButton(otherScroll, "Standard Assist Auto-Brake: OFF", 2)
+assistThrottleButton.Size = UDim2.new(1, -10, 0, 32)
+
+makeSlider(otherScroll, "Predictive Waypoints", 1, 5, CONFIG.WaypointCount, false, 3, function(v) CONFIG.WaypointCount = v end)
+makeSlider(otherScroll, "Cruise Speed (Auto-Nav)", 10, 150, CONFIG.TargetSpeed, false, 4, function(v) CONFIG.TargetSpeed = v end)
+makeSlider(otherScroll, "Turn Speed (Rad/s)", 1.0, 8.0, CONFIG.TurnRate, true, 5, function(v) CONFIG.TurnRate = v end)
+makeSlider(otherScroll, "Turn Smoothness", 1, 25, CONFIG.TurnSmoothing, false, 6, function(v) CONFIG.TurnSmoothing = v end)
+makeSlider(otherScroll, "Throttle Ramp Rate (accel/s)", 0.5, 6.0, CONFIG.ThrottleRampRate, true, 7, function(v) CONFIG.ThrottleRampRate = v end)
+
+trackConnection(keybindButton.MouseButton1Click:Connect(function()
+	bindingKey = true
+	keybindButton.Text = "Press any key..."
+end))
+
+trackConnection(assistThrottleButton.MouseButton1Click:Connect(function()
+	CONFIG.AssistAutoThrottle = not CONFIG.AssistAutoThrottle
+	if not CONFIG.AssistAutoThrottle then
+		currentThrottle = 0
+		applyAcceleration(0)
+	end
+	assistThrottleButton.Text = CONFIG.AssistAutoThrottle and "Standard Assist Auto-Brake: ON" or "Standard Assist Auto-Brake: OFF"
+	assistThrottleButton.BackgroundColor3 = CONFIG.AssistAutoThrottle and Color3.fromRGB(150, 60, 60) or Color3.fromRGB(62, 62, 70)
+end))
+
+otherScroll.CanvasSize = UDim2.new(0, 0, 0, otherList.AbsoluteContentSize.Y + 10)
+trackConnection(otherList:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+	otherScroll.CanvasSize = UDim2.new(0, 0, 0, otherList.AbsoluteContentSize.Y + 10)
+end))
+
+local function refreshToggles()
+	toggleButton.Text = CONFIG.Enabled and "Assist: ON" or "Assist: OFF"
+	toggleButton.BackgroundColor3 = CONFIG.Enabled and Color3.fromRGB(40, 135, 78) or Color3.fromRGB(120, 53, 53)
+
+	mouseFollowButton.Text = CONFIG.MouseFollow and "Mouse Follow: ON" or "Mouse Follow: OFF"
+	mouseFollowButton.BackgroundColor3 = CONFIG.MouseFollow and Color3.fromRGB(150, 110, 40) or Color3.fromRGB(62, 62, 70)
+	
+	autoNavigateButton.Text = CONFIG.AutoNavigate and "Auto-Navigate: ON" or "Auto-Navigate (Cruise & Waypoints): OFF"
+	autoNavigateButton.BackgroundColor3 = CONFIG.AutoNavigate and Color3.fromRGB(110, 40, 150) or Color3.fromRGB(62, 62, 70)
+
+	debugVisualsButton.Text = CONFIG.ShowVisuals and "Debug Visuals: ON" or "Debug Visuals: OFF"
+	debugVisualsButton.BackgroundColor3 = CONFIG.ShowVisuals and Color3.fromRGB(80, 80, 90) or Color3.fromRGB(62, 62, 70)
+	
+	keybindButton.Text = bindingKey and "Press any key..." or "Hold-Override Key: " .. CONFIG.OverrideKey.Name
+
+	assistThrottleButton.Text = CONFIG.AssistAutoThrottle and "Standard Assist Auto-Brake: ON" or "Standard Assist Auto-Brake: OFF"
+	assistThrottleButton.BackgroundColor3 = CONFIG.AssistAutoThrottle and Color3.fromRGB(150, 60, 60) or Color3.fromRGB(62, 62, 70)
+end
+
+trackConnection(toggleButton.MouseButton1Click:Connect(function()
+	CONFIG.Enabled = not CONFIG.Enabled
+	if not CONFIG.Enabled then
+		resetAssistState()
+		if steeringController then steeringController.AngularVelocity = Vector3.zero end
+	end
+	refreshToggles()
+end))
+
+trackConnection(selectButton.MouseButton1Click:Connect(function()
+	pickingVehicle = true
+	selectButton.Text = "Click your car model..."
+	selectButton.BackgroundColor3 = Color3.fromRGB(55, 105, 165)
+end))
+
+trackConnection(mouseFollowButton.MouseButton1Click:Connect(function()
+	CONFIG.MouseFollow = not CONFIG.MouseFollow
+	if CONFIG.MouseFollow then CONFIG.AutoNavigate = false end
+	isAvoiding, isRecovering, targetPosition = false, false, nil
+	currentThrottle = 0
+	applyAcceleration(0)
+	refreshToggles()
+end))
+
+trackConnection(autoNavigateButton.MouseButton1Click:Connect(function()
+	CONFIG.AutoNavigate = not CONFIG.AutoNavigate
+	if CONFIG.AutoNavigate then CONFIG.MouseFollow = false end
+	isAvoiding, isRecovering, targetPosition = false, false, nil
+	currentThrottle = 0
+	applyAcceleration(0)
+	refreshToggles()
+end))
+
+trackConnection(UserInputService.InputBegan:Connect(function(input, processed)
+	if bindingKey and input.UserInputType == Enum.UserInputType.Keyboard then
+		CONFIG.OverrideKey = input.KeyCode
+		bindingKey = false
+		refreshToggles()
+		return
+	end
+
+	if input.KeyCode == Enum.KeyCode.RightShift then
+		panel.Visible = not panel.Visible
+		return
+	end
+
+	if input.KeyCode == CONFIG.OverrideKey then isOverriding = true end
+
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		if pickingVehicle and mouse.Target then
+			selectedVehicle = findVehicle(mouse.Target)
+			if selectedVehicle then
+				steeringController = findSteeringController(selectedVehicle)
+				gearShiftRemote = findGearShiftRemote(selectedVehicle)
+				updateVehicleDimensions(selectedVehicle)
+				pickingVehicle = false
+				selectButton.Text = string.format("Car: %s (W:%.1f)", selectedVehicle.Name, vehicleWidth)
+				selectButton.BackgroundColor3 = Color3.fromRGB(62, 62, 70)
+				status.Text = string.format("Calibrated! Width: %.1f studs. Ready to drive.", vehicleWidth)
+				status.TextColor3 = CONFIG.Colors.Green
+
+				-- New vehicle = old thrust-force references and old ignore-list
+				-- watchers are dead weight. Drop them and rebuild fresh instead
+				-- of letting them pile up across every reselect this session.
+				table.clear(originalThrustForces)
+				disconnectVehicleWatchers()
+				table.insert(vehicleWatchConnections, trackConnection(
+					selectedVehicle.DescendantAdded:Connect(function() ignoreListDirty = true end)
+				))
+				table.insert(vehicleWatchConnections, trackConnection(
+					selectedVehicle.DescendantRemoving:Connect(function() ignoreListDirty = true end)
+				))
+				ignoreListDirty = false
+				timeSinceIgnoreListRebuild = 0
+				rebuildIgnoreList()
+			end
+		elseif CONFIG.AutoNavigate and mouse.Hit and not processed then
+			targetPosition = mouse.Hit.Position
+		end
+	end
+end))
+
+trackConnection(UserInputService.InputEnded:Connect(function(input)
+	if input.KeyCode == CONFIG.OverrideKey then isOverriding = false end
+end))
+
+-- == MAIN SENSOR & PREDICTION LOGIC ==
+trackConnection(RunService.Heartbeat:Connect(function(heartbeatDt)
+	local character = player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+
+	if not root or not selectedVehicle or not selectedVehicle.Parent then return end
+
+	if not steeringController or not steeringController.Parent then
+		steeringController = findSteeringController(selectedVehicle)
+		if not steeringController then return end
+	end
+
+	local carPivot = selectedVehicle:GetPivot()
+	local engine = selectedVehicle:FindFirstChild("Engine")
+	local currentVelocity = engine and engine.AssemblyLinearVelocity or Vector3.zero
+	local currentSpeed = currentVelocity.Magnitude
+
+	local dynamicRayLength = CONFIG.RayLength + (currentSpeed * 0.8)
+	local dynamicReactionDist = math.min(CONFIG.ReactionDistance + (currentSpeed * 0.6), dynamicRayLength * 0.85)
+
+	local carPitchForward = carPivot.LookVector
+	local carPitchRight   = carPivot.RightVector
+	local carPitchUp      = carPivot.UpVector
+	
+	local origin = carPivot.Position + carPitchForward * CONFIG.OffsetZ + carPitchRight * CONFIG.OffsetX + carPitchUp * CONFIG.OffsetY
+
+	-- Cached filter (see rebuildIgnoreList), debounced instead of rebuilding
+	-- on every raw descendant-churn signal or every single frame.
+	timeSinceIgnoreListRebuild += heartbeatDt
+	if not cachedRaycastParams then
+		rebuildIgnoreList()
+	elseif ignoreListDirty and timeSinceIgnoreListRebuild >= IGNORE_LIST_REBUILD_INTERVAL then
+		rebuildIgnoreList()
+		ignoreListDirty = false
+		timeSinceIgnoreListRebuild = 0
+	end
+	local params = cachedRaycastParams
+
+	-- == DIRECT INPUT TRACKING ENGINE (Fixes Straight Line Bug) ==
+	local manualSteer = 0
+	if UserInputService:IsKeyDown(Enum.KeyCode.A) or UserInputService:IsKeyDown(Enum.KeyCode.Left) then
+		manualSteer = -1
+	elseif UserInputService:IsKeyDown(Enum.KeyCode.D) or UserInputService:IsKeyDown(Enum.KeyCode.Right) then
+		manualSteer = 1
+	end
+	
+	local forwardMomentum = carPitchForward:Dot(currentVelocity)
+	local isReversing = forwardMomentum < -2
+	local moveDir = isReversing and -1 or 1
+
+	-- == ADAPTIVE RAY GEOMETRY: steering-intent bias (smoothed, never snaps) ==
+	-- -1 = fully committed left, 0 = straight, +1 = fully committed right.
+	-- Prefers live manual input; falls back to the assist's own currently
+	-- applied turn so the sensor fan adapts whether YOU are steering or the
+	-- assist is, instead of only reacting to the keyboard.
+	local rawSteerBias = 0
+	if manualSteer ~= 0 then
+		rawSteerBias = manualSteer
+	elseif CONFIG.TurnRate > 0 then
+		-- appliedTurnRate > 0 means a LEFT turn (see status text convention below),
+		-- so it's negated here to match manualSteer's convention (-1 = left).
+		rawSteerBias = -math.clamp(appliedTurnRate / CONFIG.TurnRate, -1, 1)
+	end
+	smoothedSteerBias = smoothedSteerBias + (rawSteerBias - smoothedSteerBias) * math.clamp(heartbeatDt * CONFIG.RayAdaptSmoothing, 0, 1)
+	local steerBias = smoothedSteerBias
+
+	-- == SOLID BLUE TESLA PREDICTION LINE ==
+	-- Uses a FLATTENED forward direction, not the vehicle's raw LookVector. The raw
+	-- LookVector tilts with the vehicle's pitch (braking dip, suspension bounce, hills),
+	-- which made the simulated path curve down into flat ground even though nothing was
+	-- actually there. Steering (yaw) still applies normally - only pitch/roll are ignored.
+	local predictionTime = 2.0 
+	local curveSteps = 10
+	local timeStep = predictionTime / curveSteps
+	
+	local flatForward = horizontalDirection(carPitchForward)
+	local predictedPoints = {origin}
+	local simCFrame = CFrame.lookAt(origin, origin + (flatForward * moveDir))
+	local simulatedTurnRate = manualSteer * CONFIG.TurnRate 
+	
+	for step = 1, curveSteps do
+		local stepDist = math.max(currentSpeed, 15) * timeStep
+		local steerEffect = simulatedTurnRate * timeStep * moveDir
+		simCFrame = simCFrame * CFrame.Angles(0, -steerEffect, 0)
+		simCFrame = simCFrame + (simCFrame.LookVector * stepDist)
+		table.insert(predictedPoints, simCFrame.Position)
+	end
+
+	local isIntentionalPathSafe = true
+	local sweepRadius = math.max(vehicleWidth / 2, 1)
+
+	for i = 1, #predictedPoints - 1 do
+		local pStart = predictedPoints[i]
+		local pEnd = predictedPoints[i+1]
+		local dir = pEnd - pStart
+		
+		local hit = Workspace:Spherecast(pStart, sweepRadius, dir.Unit * dir.Magnitude, params)
+		if hit and hit.Normal:Dot(Vector3.yAxis) <= CONFIG.MaxGroundSlopeNormal then
+			isIntentionalPathSafe = false
+			drawPredictiveLine(i, pStart, hit.Position)
+			for j = i + 1, curveSteps do
+				if predictionParts[j] then predictionParts[j].Transparency = 1 end
+			end
+			break
+		else
+			drawPredictiveLine(i, pStart, pEnd)
+		end
+	end
+	
+	if not CONFIG.ShowVisuals then clearPredictiveVisuals() end
+
+	-- == FAN SENSOR ENGINE: DISTANCE + CLOSING-RATE + OBSTACLE-WIDTH AWARE ==
+	local bestDirection = carPitchForward
+	local bestDistance = -math.huge
+	local repulsionNet = Vector3.zero
+	local nearestThreat = 0
+
+	-- Confidence-vote tally: how many rays per side read "safe" (green) vs
+	-- how many total rays fall on that side. Used below to decide whether we
+	-- have a confident majority toward one side, or just a coin flip.
+	local greenCountLeft, totalLeft = 0, 0
+	local greenCountRight, totalRight = 0, 0
+
+	if not CONFIG.ShowVisuals then 
+		clearVisuals() 
+	else
+		cleanUnusedVisuals()
+	end
+
+	-- Pass 1: cast every ray and record raw geometry first, so Pass 2 can look at
+	-- neighboring rays to tell a wide wall apart from a single thin obstacle (lamppost, pole, sign).
+	-- Each ray's actual cast angle and max length are no longer fixed - they
+	-- shift smoothly based on `steerBias` (see header comment): rays aligned
+	-- with the current steering commitment get longer range, rays opposed to
+	-- it get shorter, and (while driving roughly straight) the outer rays fan
+	-- out a little wider for better peripheral coverage.
+	local rayInfo = {}
+	local halfSpread = math.max(CONFIG.SpreadDegrees / 2, 1)
+	for i = 1, CONFIG.RayCount do
+		local alpha = (CONFIG.RayCount == 1) and 0.5 or (i - 1) / (CONFIG.RayCount - 1)
+		local baseAngle = -CONFIG.SpreadDegrees / 2 + CONFIG.SpreadDegrees * alpha
+		local s = baseAngle / halfSpread -- -1 (left) .. 0 (front) .. 1 (right)
+
+		local alignment = 1 - math.abs(s - steerBias) / 2 -- 1 = ray matches current steering commitment
+		local edgeShrink = 0.5 * math.abs(s) * (1 - math.abs(steerBias))   -- edges pull in slightly while driving straight
+		local frontShrink = 0.6 * (1 - math.abs(s)) * math.abs(steerBias) -- front pulls in while actively turning
+		local deviation = (2 * alignment - 1) - edgeShrink - frontShrink
+		local lengthMult = math.clamp(1 + CONFIG.RayLengthVariance * deviation, 0.35, 1.75)
+
+		-- Extra outward fan-out for edge rays, but only while driving roughly
+		-- straight (fades out as steering commitment increases).
+		local angleShift = CONFIG.RayAngleShift * (s * s * s) * (1 - math.abs(steerBias))
+		local finalAngleDeg = baseAngle + angleShift
+
+		-- FIX (v6.1): negate the angle fed into fromAxisAngle. Previously a
+		-- positive finalAngleDeg (labeled/tallied as "right" everywhere else
+		-- in this script) physically rotated the ray toward the car's LEFT,
+		-- and vice versa - causing rays labeled "left" to extend/shrink on
+		-- the physical right, and the confidence vote to steer toward the
+		-- physically worse (red) side.
+		local direction = (CFrame.fromAxisAngle(carPitchUp, math.rad(-finalAngleDeg)) * carPitchForward).Unit
+		local rayMaxLength = dynamicRayLength * lengthMult
+
+		local hit = Workspace:Raycast(origin, direction * rayMaxLength, params)
+		local distance = rayMaxLength
+		local hitObstacle = false
+
+		if hit then
+			if hit.Normal:Dot(Vector3.yAxis) > CONFIG.MaxGroundSlopeNormal then
+				distance = rayMaxLength
+			else
+				distance = (hit.Position - origin).Magnitude
+				hitObstacle = true
+			end
+		end
+
+		rayInfo[i] = { angle = finalAngleDeg, direction = direction, distance = distance, hitObstacle = hitObstacle }
+	end
+
+	-- Pass 2: turn raw distances into a threat value per ray, blending three things:
+	--  1) how close it already is (static distance)
+	--  2) how fast we're actually closing the gap on THAT specific direction - drifting
+	--     toward it ramps this up fast; merely passing near it tangentially barely moves it
+	--  3) how wide the obstacle is - a wall spanning several rays gets full weight, a thin
+	--     hazard (lamppost, sign, pole) that only clips one ray gets discounted
+	-- Rays that never actually hit anything (hitObstacle == false) contribute ZERO
+	-- threat - a ray simply reaching its own max sensor range with nothing there
+	-- is not "a distance to something," so it can't fake a closing-rate on an
+	-- open road anymore. Every ray is also tallied green/not-green per side for
+	-- the confidence vote used by Standard Assist and headless Auto-Navigate below.
+	for i = 1, CONFIG.RayCount do
+		local info = rayInfo[i]
+		local distance, direction, angle = info.distance, info.direction, info.angle
+
+		local neighborsClose = 0
+		for offset = -2, 2 do
+			if offset ~= 0 then
+				local neighbor = rayInfo[i + offset]
+				if neighbor and neighbor.hitObstacle and neighbor.distance < dynamicReactionDist * 1.15 then
+					neighborsClose += 1
+				end
+			end
+		end
+		local widthFactor = math.clamp((neighborsClose + 1) / 5, 0.2, 1)
+
+		local threatUrgency = 0
+		if info.hitObstacle then
+			local closingSpeed = currentVelocity:Dot(direction)
+			local timeToImpact = closingSpeed > 0.5 and (distance / closingSpeed) or math.huge
+			local closingUrgency = math.clamp(1 - (timeToImpact / CONFIG.ClosingRateWindow), 0, 1)
+
+			local distUrgency = math.clamp(1 - (distance / dynamicReactionDist), 0, 1)
+			local rawUrgency = math.max(distUrgency, closingUrgency)
+			threatUrgency = rawUrgency * widthFactor
+		end
+
+		local elementColor = evaluateSeverity(threatUrgency)
+
+		-- Full driver authority: while you're actively steering, ray color stops
+		-- reflecting assist threat level entirely and instead reflects your own
+		-- input - the whole side you're turning toward reads solid green (assist
+		-- has backed off there), the opposite side reads solid red (assist is
+		-- not going to intervene there either). This makes it visually obvious
+		-- the assist isn't fighting you, on either side, at all.
+		if math.abs(manualSteer) > 0.1 then
+			local turningLeft = manualSteer < 0
+			local onLeftSide = angle < 0
+			if turningLeft then
+				elementColor = onLeftSide and CONFIG.Colors.Green or CONFIG.Colors.Red
+			else
+				elementColor = onLeftSide and CONFIG.Colors.Red or CONFIG.Colors.Green
+			end
+		end
+
+		drawRay(i, origin, origin + direction * distance, elementColor)
+
+		if angle < -10 then
+			totalLeft += 1
+			if threatUrgency < CONFIG.GreenThreshold then greenCountLeft += 1 end
+		elseif angle > 10 then
+			totalRight += 1
+			if threatUrgency < CONFIG.GreenThreshold then greenCountRight += 1 end
+		end
+
+		if distance > bestDistance then
+			bestDistance = distance
+			bestDirection = direction
+		end
+
+		nearestThreat = math.max(nearestThreat, threatUrgency)
+
+		if threatUrgency > 0 then
+			repulsionNet = repulsionNet - (direction * (threatUrgency * threatUrgency))
+		end
+	end
+
+	-- Confidence-vote result: which side has a meaningfully higher fraction of
+	-- safe (green) rays. Positive decisionBias favors LEFT (matches the sign
+	-- convention used by targetTurnRate/status text below); negative favors
+	-- RIGHT. A side with no rays at all reads as neutral (0.5), not a win.
+	local safeFractionLeft = totalLeft > 0 and (greenCountLeft / totalLeft) or 0.5
+	local safeFractionRight = totalRight > 0 and (greenCountRight / totalRight) or 0.5
+	local decisionBias = safeFractionLeft - safeFractionRight
+	local confidenceMargin = math.abs(decisionBias)
+
+	if not CONFIG.Enabled or isOverriding then
+		if isOverriding then
+			status.Text = "MANUAL OVERRIDE (Key Held)"
+			status.TextColor3 = Color3.fromRGB(200, 100, 255)
+		else
+			status.Text = "Assist off."
+			status.TextColor3 = Color3.fromRGB(190, 190, 190)
+		end
+		resetAssistState()
+		return
+	end
+
+	local carForwardFlat = horizontalDirection(carPivot.LookVector)
+	local urgency = nearestThreat
+	currentUrgency = urgency
+
+	-- == ZERO-INTERFERENCE DRIVER OVERRIDE (Absolute Priority) ==
+	if math.abs(manualSteer) > 0.1 then
+		urgency = 0 
+		currentUrgency = 0
+		repulsionNet = Vector3.zero
+		targetTurnRate = 0
+		isAvoiding = false
+		isRecovering = false
+		recoveryHeading = nil
+
+		-- Release any assist-held brake/throttle the instant you take the wheel,
+		-- instead of letting it keep applying against your input.
+		if CONFIG.AssistAutoThrottle and currentThrottle ~= 0 then
+			currentThrottle = 0
+		end
+		
+		if isIntentionalPathSafe then
+			status.Text = isReversing and "MANUAL REVERSE: Path Clear" or "MANUAL TURN: Path Clear"
+			status.TextColor3 = CONFIG.Colors.Blue
+		else
+			status.Text = "MANUAL OVERRIDE: WARNING! Path Obstructed!"
+			status.TextColor3 = CONFIG.Colors.Red
+		end
+		return
+	end
+
+	-- == AUTO-NAVIGATE (DYNAMIC BEZIER WAYPOINTS & CRUISE CONTROL) ==
+	-- Always has full auto-throttle, auto-brake, and auto-reverse - unaffected by the
+	-- standard-assist auto-brake toggle, which only applies outside Auto-Navigate/Mouse-Follow.
+	if CONFIG.AutoNavigate then
+		local speedError = (CONFIG.TargetSpeed - currentSpeed) / CONFIG.TargetSpeed
+		local cruiseThrottle = math.clamp(speedError * 2.5, -0.5, 1.0)
+		
+		if urgency > CONFIG.EngageUrgency then
+			cruiseThrottle = math.clamp(1 - (urgency * 2.2), -0.8, 0.3)
+		end
+		updateThrottle(heartbeatDt, cruiseThrottle, currentSpeed)
+
+		if not targetPosition then
+			-- No GPS destination yet: same confidence-vote logic as Standard
+			-- Assist below. Only swerve when one side is a confidently safer
+			-- bet than the other; otherwise hold straight rather than guess.
+			local avoidTurn = 0
+			if urgency > CONFIG.EngageUrgency and confidenceMargin >= CONFIG.DecisionConfidence then
+				local decisiveness = math.clamp((confidenceMargin - CONFIG.DecisionConfidence) / (1 - CONFIG.DecisionConfidence), 0, 1)
+				avoidTurn = (decisionBias > 0 and 1 or -1) * decisiveness
+			end
+			targetTurnRate = avoidTurn * CONFIG.TurnRate
+			status.Text = string.format("AUTONOMOUS CRUISE (No GPS Target) | Spd: %.0f | Thr: %.1f", currentSpeed, currentThrottle)
+			status.TextColor3 = CONFIG.Colors.Blue
+			for w = 1, 5 do drawWaypoint(w, nil) end
+			return
+		end
+
+		local distToTarget = (targetPosition - carPivot.Position).Magnitude
+		if distToTarget < 18 then
+			targetTurnRate = 0
+			currentThrottle = 0
+			applyAcceleration(0)
+			targetPosition = nil
+			status.Text = "AUTO-NAVIGATE: Destination reached!"
+			status.TextColor3 = CONFIG.Colors.Green
+			for w = 1, 5 do drawWaypoint(w, nil) end
+			return
+		end
+
+		local p0 = carPivot.Position + (currentVelocity * 0.5)
+		local p2 = targetPosition
+		local toTargetDir = horizontalDirection(targetPosition - carPivot.Position)
+		local p1 = carPivot.Position + (toTargetDir * math.min(distToTarget * 0.5, 45))
+		
+		if urgency > CONFIG.EngageUrgency then
+			local bypassOffset = horizontalDirection(bestDirection + repulsionNet * 2.5) * (vehicleWidth * 3.0)
+			p1 = carPivot.Position + (bestDirection * 35) + bypassOffset
+		end
+
+		local numWaypoints = math.clamp(CONFIG.WaypointCount, 1, 5)
+		local firstWaypointPos = nil
+
+		for w = 1, 5 do
+			if w <= numWaypoints then
+				local t = w / numWaypoints
+				local wpPos = ((1 - t)^2 * p0) + (2 * (1 - t) * t * p1) + (t^2 * p2)
+				if w == 1 then firstWaypointPos = wpPos end
+				local label = (w == numWaypoints) and "Target (P" .. w .. ")" or ("Path P" .. w)
+				local color = (w == 1) and CONFIG.Colors.Yellow or ((w == numWaypoints) and CONFIG.Colors.Purple or CONFIG.Colors.Blue)
+				drawWaypoint(w, wpPos, color, label)
+			else
+				drawWaypoint(w, nil)
+			end
+		end
+
+		if firstWaypointPos then
+			local steerTargetDir = horizontalDirection(firstWaypointPos - carPivot.Position)
+			local baseAngle = signedAngleY(carForwardFlat, steerTargetDir)
+			
+			if math.abs(baseAngle) < math.rad(2.0) then
+				targetTurnRate = 0
+			else
+				targetTurnRate = math.clamp(baseAngle / math.rad(35), -1, 1) * CONFIG.TurnRate
+			end
+		end
+		
+		status.Text = string.format("NAVIGATING (%d Pts) | Spd: %.0f/%d | Thr: %.1f", numWaypoints, currentSpeed, CONFIG.TargetSpeed, currentThrottle)
+		status.TextColor3 = urgency > CONFIG.EngageUrgency and CONFIG.Colors.Orange or CONFIG.Colors.Blue
+		return
+	end
+
+	-- == MOUSE FOLLOW ==
+	if CONFIG.MouseFollow then
+		isAvoiding, isRecovering = false, false
+		local hitPosition = mouse.Hit and mouse.Hit.Position
+		if hitPosition then
+			local toTarget = horizontalDirection(hitPosition - carPivot.Position)
+			local angle = signedAngleY(carForwardFlat, toTarget)
+			if math.abs(angle) < math.rad(2) then
+				targetTurnRate = 0
+			else
+				targetTurnRate = math.clamp(angle / math.rad(CONFIG.MouseFollowMaxAngleDegrees), -1, 1) * CONFIG.TurnRate
+			end
+			if CONFIG.InvertSteering then targetTurnRate = -targetTurnRate end
+			
+			local dist = (hitPosition - carPivot.Position).Magnitude
+			updateThrottle(heartbeatDt, dist > 20 and 0.8 or 0, currentSpeed)
+		else
+			targetTurnRate = 0
+			updateThrottle(heartbeatDt, 0, currentSpeed)
+		end
+		currentUrgency = 1
+		status.Text = "FOLLOWING MOUSE"
+		status.TextColor3 = CONFIG.Colors.Yellow
+		return
+	end
+
+	-- == STANDARD ASSIST (CONFIDENCE-VOTE EVASION ENGINE, SEVERITY-SCALED TURN INTENSITY) ==
+	if urgency > CONFIG.EngageUrgency then
+		if not isAvoiding then
+			recoveryHeading = carForwardFlat
+			isAvoiding = true
+		end
+		isRecovering = false
+
+		local severityColor, turnIntensity = evaluateSeverity(urgency)
+		local confidencePct = math.floor(confidenceMargin * 100 + 0.5)
+
+		if confidenceMargin >= CONFIG.DecisionConfidence then
+			-- Confident majority on one side (e.g. 70% safe left vs 30% safe
+			-- right) - commit to it. decisiveness scales the turn from "just
+			-- cleared the bar" to "overwhelmingly one-sided".
+			local decisiveness = math.clamp((confidenceMargin - CONFIG.DecisionConfidence) / (1 - CONFIG.DecisionConfidence), 0, 1)
+			local turnSign = decisionBias > 0 and 1 or -1
+			if CONFIG.InvertSteering then turnSign = -turnSign end
+			targetTurnRate = turnSign * decisiveness * CONFIG.TurnRate * turnIntensity
+
+			local sideText = (targetTurnRate > 0) and "LEFT" or "RIGHT"
+			if CONFIG.AssistAutoThrottle then
+				local brakeTarget = math.clamp(1 - (urgency * 2.2), -0.8, 0.3)
+				updateThrottle(heartbeatDt, brakeTarget, currentSpeed)
+				status.Text = string.format("ASSIST - GUIDING %s (%d%% confident) + BRAKING", sideText, confidencePct)
+			else
+				status.Text = string.format("ASSIST - GUIDING %s (%d%% confident)", sideText, confidencePct)
+			end
+		else
+			-- No clear majority either side (near coin-flip) - a reliable system
+			-- doesn't gamble on a 50/50 read. Hold heading instead of guessing;
+			-- auto-brake (if enabled) still slows the car for the danger ahead.
+			targetTurnRate = 0
+			if CONFIG.AssistAutoThrottle then
+				local brakeTarget = math.clamp(1 - (urgency * 2.2), -0.8, 0.3)
+				updateThrottle(heartbeatDt, brakeTarget, currentSpeed)
+				status.Text = string.format("ASSIST - AMBIGUOUS (%d%%), HOLDING STRAIGHT + BRAKING", confidencePct)
+			else
+				status.Text = string.format("ASSIST - AMBIGUOUS (%d%%), HOLDING STRAIGHT", confidencePct)
+			end
+		end
+		status.TextColor3 = severityColor
+		return
+	end
+
+	-- Danger has cleared - if auto-brake was engaged, hand throttle control back to the
+	-- driver immediately rather than holding brake or coasting on our own.
+	if CONFIG.AssistAutoThrottle and currentThrottle ~= 0 then
+		currentThrottle = 0
+	end
+
+	if isAvoiding then
+		isAvoiding = false
+		isRecovering = true
+	end
+
+	if isRecovering and recoveryHeading then
+		local angle = signedAngleY(carForwardFlat, recoveryHeading)
+		if math.abs(angle) <= math.rad(CONFIG.RecoveryToleranceDegrees) then
+			isRecovering, recoveryHeading, targetTurnRate = false, nil, 0
+			status.Text = "CLEAR - straight priority locked"
+			status.TextColor3 = CONFIG.Colors.Green
+		else
+			local turnStrength = math.clamp(angle / math.rad(CONFIG.RecoveryMaxAngleDegrees), -1, 1)
+			targetTurnRate = (CONFIG.InvertSteering and -turnStrength or turnStrength) * (CONFIG.TurnRate * 0.75)
+			status.Text = "CORRECTING HEADING"
+			status.TextColor3 = CONFIG.Colors.Orange
+		end
+		return
+	end
+
+	targetTurnRate = 0
+	status.Text = "CLEAR - straight priority (manual active)"
+	status.TextColor3 = CONFIG.Colors.Green
+end))
+
+RunService:BindToRenderStep("AutoDriveAssist_ApplyAngularVelocity", Enum.RenderPriority.Last.Value, function(dt)
+	if not steeringController or not steeringController.Parent then return end
+
+	-- Check true driver intent right here inside execution
+	local manualSteer = 0
+	if UserInputService:IsKeyDown(Enum.KeyCode.A) or UserInputService:IsKeyDown(Enum.KeyCode.Left) or
+	   UserInputService:IsKeyDown(Enum.KeyCode.D) or UserInputService:IsKeyDown(Enum.KeyCode.Right) then
+		manualSteer = 1
+	end
+
+	-- Manual input (or assist disabled/overridden) always wins immediately - no stale torque lingers.
+	if manualSteer == 1 or isOverriding or not CONFIG.Enabled or not selectedVehicle then
+		if wasControlling then
+			appliedTurnRate = 0
+			steeringController.AngularVelocity = Vector3.zero
+			wasControlling = false
+		end
+		return
+	end
+
+	local active = CONFIG.MouseFollow or CONFIG.AutoNavigate or (currentUrgency > CONFIG.EngageUrgency) or isRecovering
+
+	if active then
+		-- Respond faster as urgency increases so red/orange corrections aren't smoothed away.
+		local urgencyBoost = 1 + (currentUrgency * 3)
+		local responsiveness = CONFIG.TurnSmoothing * urgencyBoost
+		appliedTurnRate += (targetTurnRate - appliedTurnRate) * math.clamp(dt * responsiveness, 0, 1)
+		steeringController.AngularVelocity = Vector3.new(0, appliedTurnRate, 0)
+		wasControlling = true
+	elseif wasControlling then
+		appliedTurnRate = 0
+		steeringController.AngularVelocity = Vector3.zero
+		wasControlling = false
+	end
+end)
+
+trackConnection(player.CharacterAdded:Connect(function()
+	resetAssistState()
+	ignoreListDirty = true
+	rebuildIgnoreList() -- character reference changed on respawn, refresh the cached filter immediately
+end))
+
+refreshToggles()
