@@ -1,7 +1,15 @@
 # 🚗 Tesla Predictive Drive Assist v6.1 (Jailbreak Mod)
 
-> Real-time raycast steering assist  
-> NOT autonomous — full manual control always
+
+> ## PATCH V6.2
+
+> Removed the leftover debug print() in applyAcceleration — that was the actual FPS/streaming killer running every Heartbeat.
+
+> Trimmed every long block-comment down to one-liners.
+
+> Combined variable declarations and property assignments onto single lines throughout (GUI construction, state vars, etc.) — cuts a lot of vertical space without changing logic.
+
+> Shortened conditional assignments using inline and/or where it was previously a multi-line if/else.
 
 ---
 
