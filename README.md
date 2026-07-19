@@ -3,7 +3,7 @@
 Game: https://www.roblox.com/games/606849621/Jailbreak
 
 
-> ## PATCH V6.2
+> ## Patch/Changes V6.2
 
 > Removed the leftover debug print() in applyAcceleration — that was the actual FPS/streaming killer running every Heartbeat.
 
