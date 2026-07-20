@@ -1,10 +1,4 @@
 
--- v6.2: removed leftover per-frame debug print() in applyAcceleration (was firing every
--- Heartbeat while any assist mode ran, generating constant string garbage + LogService
--- buffer growth -> GC pressure -> FPS drop -> Roblox's adaptive streaming throttled
--- terrain/instance LOD down even though quality settings were untouched). Comments
--- condensed and code compacted; no behavior changes from v6.1 otherwise.
-
 local Players, RunService, Workspace, UserInputService =
 	game:GetService("Players"), game:GetService("RunService"),
 	game:GetService("Workspace"), game:GetService("UserInputService")
