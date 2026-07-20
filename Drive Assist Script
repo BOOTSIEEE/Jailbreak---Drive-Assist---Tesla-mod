@@ -1,5 +1,4 @@
--- Auto-Drive Assist: Predictive Proximity Engine & Dynamic Bezier Waypoints (v6.2)
--- LocalScript: StarterPlayer > StarterPlayerScripts
+
 -- v6.2: removed leftover per-frame debug print() in applyAcceleration (was firing every
 -- Heartbeat while any assist mode ran, generating constant string garbage + LogService
 -- buffer growth -> GC pressure -> FPS drop -> Roblox's adaptive streaming throttled
